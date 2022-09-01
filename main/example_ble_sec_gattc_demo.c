@@ -29,8 +29,19 @@
 #include "esp_gatt_common_api.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_system.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "driver/twai.h"
 
-#define GATTC_TAG             "SEC_GATTC_DEMO"
+// #include "sdkconfig.h"
+
+#define GATTC_TAG             "SEC_GATTC"
+#define LOOP_TAG             "LOOP"
+#define UART1_TAG             "UART1"
+#define CAN_TAG                 "CAN_BUS"
 //#define REMOTE_SERVICE_UUID   0x331a36f5245945ea9d956142f0c4b307
 //ESP_GATT_UUID_HEART_RATE_SVC
 //#define REMOTE_NOTIFY_UUID    0x2A37
@@ -123,8 +134,17 @@ static esp_bt_uuid_t remote_filter_service_uuid = {
 
 static bool connect = false;
 static bool get_service = false;
-static const char remote_device_name[] = "BGX-****";
+static bool ble_device_ready = false;
 
+static uint32_t time_request_MSG = 0;
+static uint32_t time_request_SCAN = 0;
+static uint32_t tick_interval_MSG = 200;
+static uint8_t message_send_index = 0;
+static bool scan_busy = true;
+static const int allowed_minimum_rssi = -60;
+static const char remote_device_name[] = "UB-*****";
+static char connected_device_name[10];
+const uint8_t remote_device_name_prefix_length = 3;
 static esp_ble_scan_params_t ble_scan_params = {
     .scan_type              = BLE_SCAN_TYPE_ACTIVE,
     .own_addr_type          = BLE_ADDR_TYPE_RANDOM,
@@ -158,6 +178,14 @@ static struct gattc_profile_inst gl_profile_tab[PROFILE_NUM] = {
         .gattc_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
     },
 };
+
+static const int uart_num = UART_NUM_1;
+#define UART_RX_BUF_SIZE 127
+static uint8_t uart_rx_buffer[UART_RX_BUF_SIZE];
+static bool can_bus_listen = false;
+
+static uint16_t MODBUS_CRC16_V1( const uint8_t *buf, uint16_t len );
+static bool MODBUS_CRC_pass(uint8_t* data, uint16_t data_len);
 
 static const char *esp_key_type_to_str(esp_ble_key_type_t key_type)
 {
@@ -268,13 +296,15 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
     case ESP_GATTC_SEARCH_RES_EVT: {
         ESP_LOGI(GATTC_TAG, "SEARCH RES: conn_id = %x is primary service %d", p_data->search_res.conn_id, p_data->search_res.is_primary);
         ESP_LOGI(GATTC_TAG, "start handle %d end handle %d current handle value %d", p_data->search_res.start_handle, p_data->search_res.end_handle, p_data->search_res.srvc_id.inst_id);
-        //if (p_data->search_res.srvc_id.uuid.len == ESP_UUID_LEN_128 && p_data->search_res.srvc_id.uuid.uuid.uuid128 == REMOTE_SERVICE_UUID) {
+        if (p_data->search_res.srvc_id.uuid.len == ESP_UUID_LEN_128 && (memcmp(p_data->search_res.srvc_id.uuid.uuid.uuid128,REMOTE_SERVICE_UUID_ARRAY,sizeof(REMOTE_SERVICE_UUID_ARRAY))==0)) {
+            
         //if (p_data->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16 && p_data->search_res.srvc_id.uuid.uuid.uuid16 == REMOTE_SERVICE_UUID) {
-            ESP_LOGI(GATTC_TAG, "UUID128: %x", p_data->search_res.srvc_id.uuid.uuid.uuid128);
+            //ESP_LOGI(GATTC_TAG, "UUID128: %x", p_data->search_res.srvc_id.uuid.uuid.uuid128);
+            ESP_LOGI(GATTC_TAG, "found matched service UUID128"); 
             get_service = true;
             gl_profile_tab[PROFILE_A_APP_ID].service_start_handle = p_data->search_res.start_handle;
             gl_profile_tab[PROFILE_A_APP_ID].service_end_handle = p_data->search_res.end_handle;
-        //}
+        }
         break;
     }
     case ESP_GATTC_SEARCH_CMPL_EVT:
@@ -413,17 +443,19 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             ESP_LOGE(GATTC_TAG, "write descr failed, error status = %x", p_data->write.status);
             break;
         }
-        ESP_LOGI(GATTC_TAG, "write descr success");
-        uint8_t value[]={'a', 'b'};
-        esp_ble_gattc_write_char(gattc_if,
-                                gl_profile_tab[PROFILE_A_APP_ID].conn_id,
-                                gl_profile_tab[PROFILE_A_APP_ID].write_char_handle,
+        ESP_LOGI(GATTC_TAG, "> write descr success, bt is ready");
+        // uint8_t value[]={'a', 'b'};
+        // esp_ble_gattc_write_char(gattc_if,
+        //                         gl_profile_tab[PROFILE_A_APP_ID].conn_id,
+        //                         gl_profile_tab[PROFILE_A_APP_ID].write_char_handle,
                                 
-                                sizeof(value),
-                                value,
-                                ESP_GATT_WRITE_TYPE_RSP,
-                                ESP_GATT_AUTH_REQ_SIGNED_NO_MITM);
-
+        //                         sizeof(value),
+        //                         value,
+        //                         ESP_GATT_WRITE_TYPE_RSP,
+        //                         ESP_GATT_AUTH_REQ_SIGNED_NO_MITM);
+        message_send_index = 0;
+        ble_device_ready = true;
+        
         break;
     case ESP_GATTC_SRVC_CHG_EVT: {
         esp_bd_addr_t bda;
@@ -441,8 +473,10 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         break;
     case ESP_GATTC_DISCONNECT_EVT:
         ESP_LOGI(GATTC_TAG, "ESP_GATTC_DISCONNECT_EVT, reason = 0x%x", p_data->disconnect.reason);
+        ble_device_ready = false;
         connect = false;
         get_service = false;
+        scan_busy = false;
         break;
     default:
         break;
@@ -466,7 +500,8 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         break;
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT: {
         //the unit of the duration is second
-        uint32_t duration = 30;
+        uint32_t duration = 5;
+        scan_busy = true;
         esp_ble_gap_start_scanning(duration);
         break;
     }
@@ -533,26 +568,36 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
         switch (scan_result->scan_rst.search_evt) {
         case ESP_GAP_SEARCH_INQ_RES_EVT:
-            esp_log_buffer_hex(GATTC_TAG, scan_result->scan_rst.bda, 6);
-            ESP_LOGI(GATTC_TAG, "Searched Adv Data Len %d, Scan Response Len %d", scan_result->scan_rst.adv_data_len, scan_result->scan_rst.scan_rsp_len);
+            //esp_log_buffer_hex(GATTC_TAG, scan_result->scan_rst.bda, 6);
+            //ESP_LOGI(GATTC_TAG, "Searched Adv Data Len %d, Scan Response Len %d, rssi=%d", scan_result->scan_rst.adv_data_len, scan_result->scan_rst.scan_rsp_len, scan_result->scan_rst.rssi);
             adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
                                                 ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
-            ESP_LOGI(GATTC_TAG, "Searched Device Name Len %d", adv_name_len);
-            esp_log_buffer_char(GATTC_TAG, adv_name, adv_name_len);
-            ESP_LOGI(GATTC_TAG, "\n");
+            //ESP_LOGI(GATTC_TAG, "Searched Device Name Len %d", adv_name_len);
+            //esp_log_buffer_char(GATTC_TAG, adv_name, adv_name_len);
+            //ESP_LOGI(GATTC_TAG, "\n");
             if (adv_name != NULL) {
-                if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, 4) == 0) {
-                    ESP_LOGI(GATTC_TAG, "searched device %s\n", remote_device_name);
-                    if (connect == false) {
+                if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, remote_device_name_prefix_length) == 0) {
+                    memset(connected_device_name, 0, sizeof(connected_device_name));
+                    memcpy(connected_device_name, (char*)adv_name, sizeof(connected_device_name)-1);
+                    ESP_LOGI(GATTC_TAG, "searched device %s, rssi = %d\n", (char *)adv_name, scan_result->scan_rst.rssi);
+                    if(scan_result->scan_rst.rssi >= allowed_minimum_rssi){
+                        if (connect == false) {
                         connect = true;
                         ESP_LOGI(GATTC_TAG, "connect to the remote device.");
                         esp_ble_gap_stop_scanning();
                         esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, scan_result->scan_rst.ble_addr_type, true);
+                        }
                     }
+                    else{
+                        ESP_LOGI(GATTC_TAG, "remote device rssi is too weak");
+                    }
+                    
                 }
             }
             break;
         case ESP_GAP_SEARCH_INQ_CMPL_EVT:
+            scan_busy = false;
+            ESP_LOGI(GATTC_TAG, "ESP_GAP_SEARCH_INQ_CMPL_EVT ??");
             break;
         default:
             break;
@@ -603,7 +648,56 @@ static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp
         }
     } while (0);
 }
+void ble_send_bytes(uint8_t *bytes, uint8_t len)
+{
+    if (!ble_device_ready)
+        return;
+    esp_ble_gattc_write_char(gl_profile_tab[PROFILE_A_APP_ID].gattc_if,
+                             gl_profile_tab[PROFILE_A_APP_ID].conn_id,
+                             gl_profile_tab[PROFILE_A_APP_ID].write_char_handle,
+                             len,
+                             bytes,
+                             ESP_GATT_WRITE_TYPE_RSP,
+                             ESP_GATT_AUTH_REQ_SIGNED_NO_MITM);
+}
 
+void ble_trigger_scan(){
+    esp_err_t scan_ret = esp_ble_gap_set_scan_params(&ble_scan_params);
+        if (scan_ret){
+            ESP_LOGE(GATTC_TAG, "set scan params error, error code = %x", scan_ret);
+        }
+}
+void can_loop()
+{
+    twai_message_t message;
+    if (twai_receive(&message, pdMS_TO_TICKS(10000)) == ESP_OK)
+    {
+        ESP_LOGI(CAN_TAG, "Message received");
+    }
+    else
+    {
+        //ESP_LOGE(CAN_TAG, "Failed to receive message");
+        return;
+    }
+
+    // Process received message
+    if (message.extd)
+    {
+        ESP_LOGI(CAN_TAG, "Message is in Extended Format");
+    }
+    else
+    {
+        ESP_LOGI(CAN_TAG, "Message is in Standard Format");
+    }
+    ESP_LOGI(CAN_TAG, "ID is %d\n", message.identifier);
+    if (!(message.rtr))
+    {
+        for (int i = 0; i < message.data_length_code; i++)
+        {
+            ESP_LOGI(CAN_TAG, "Data byte %d = %d\n", i, message.data[i]);
+        }
+    }
+}
 void app_main(void)
 {
     // Initialize NVS.
@@ -613,6 +707,55 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+
+    
+    uart_config_t uart_config = {
+        .baud_rate = 19200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 122
+    };
+    ESP_ERROR_CHECK(uart_driver_install(uart_num, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
+    // Set UART pins(TX: IO4, RX: IO5, RTS: IO18, CTS: IO19)
+    ESP_ERROR_CHECK(uart_set_pin(uart_num, 3, 4, -1, -1));
+    // Set RS485 half duplex mode
+    ESP_ERROR_CHECK(uart_set_mode(uart_num, UART_MODE_RS485_HALF_DUPLEX));
+
+    // Set read timeout of UART TOUT feature
+    ESP_ERROR_CHECK(uart_set_rx_timeout(uart_num, 5));
+    // char* msg = "abc\r\n";
+    // if (uart_write_bytes(uart_num, (uint8_t*)msg, strlen(msg)) != strlen(msg)) {
+    //     ESP_LOGE(UART1_TAG, "Send data critical failure.");
+    // }
+
+    //TWAI_GENERAL_CONFIG_DEFAULT(tx_io_num, rx_io_num, op_mode)
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(5, 8, TWAI_MODE_NORMAL);
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    //Install TWAI driver
+    if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
+        ESP_LOGI(CAN_TAG, "Driver installed");
+        //Start TWAI driver
+        if (twai_start() == ESP_OK)
+        {
+            ESP_LOGI(CAN_TAG, "Driver started");
+        }
+        else
+        {
+            ESP_LOGE(CAN_TAG, "Failed to start driver");
+            return;
+        }
+    } else {
+        ESP_LOGE(CAN_TAG, "CAN bus failed to install driver");
+    }
+
+    
+    
+
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -682,4 +825,188 @@ void app_main(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
 
+    while(1){
+        uint32_t t = xTaskGetTickCount();
+        if(t - time_request_SCAN >= 200){
+            time_request_SCAN = t;
+            ESP_LOGI(LOOP_TAG, "Loop time_request_SCAN = %d, ready = %d, scan busy=%d", connect, ble_device_ready, scan_busy);
+            //char* msg = "VER\r\n";
+            //ble_send_bytes((uint8_t*)msg,strlen(msg));
+            if(!connect && !scan_busy){
+                ble_trigger_scan();
+            }
+        }
+        // if (ble_device_ready)
+        // {
+
+        //     if (t - time_request_MSG >= tick_interval_MSG)
+        //     {
+        //         time_request_MSG = t;
+
+        //         if (message_send_index == 0)
+        //         {
+        //             message_send_index = 1;
+        //             tick_interval_MSG = 50;
+        //             char *msg = "%%%\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //         else if (message_send_index == 1)
+        //         {
+        //             message_send_index = 2;
+        //             tick_interval_MSG = 50;
+        //             char *msg = "MIRRA\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //         else if (message_send_index == 2)
+        //         {
+        //             message_send_index = 3;
+        //             tick_interval_MSG = 250;
+        //             // char* msg = "ABCDEF\r\n";
+        //             // ble_send_bytes((uint8_t*)msg,strlen(msg));
+        //             if (strlen(connected_device_name) > 0)
+        //             {
+        //                 uint8_t msg[strlen(connected_device_name) + 2];
+        //                 memcpy(msg, (uint8_t *)connected_device_name, strlen(connected_device_name));
+        //                 msg[strlen(connected_device_name)] = '\r';
+        //                 msg[strlen(connected_device_name) + 1] = '\n';
+        //                 ble_send_bytes(msg, strlen(connected_device_name) + 2);
+        //             }
+        //         }
+        //         else if (message_send_index == 3)
+        //         {
+        //             message_send_index = 4;
+        //             tick_interval_MSG = 50;
+        //             char *msg = "%%%\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //         else if (message_send_index == 4)
+        //         {
+        //             message_send_index = 5;
+        //             tick_interval_MSG = 50;
+        //             char *msg = "MIRRL\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //         else if (message_send_index == 5)
+        //         {
+        //             message_send_index = 6;
+        //             tick_interval_MSG = 200;
+        //             char *msg = "RMZ\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //         else if (message_send_index == 6)
+        //         {
+        //             message_send_index = 7;
+        //             tick_interval_MSG = 500;
+        //             char *msg = "RMS\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //         else if (message_send_index == 7)
+        //         {
+        //             message_send_index = 8;
+        //             tick_interval_MSG = 50;
+        //             char *msg = "RMC\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //         else if (message_send_index == 8)
+        //         {
+        //             message_send_index = 9;
+        //             tick_interval_MSG = 200;
+        //             char *msg = "%%%\r\n";
+        //             ble_send_bytes((uint8_t *)msg, strlen(msg));
+        //         }
+        //     }
+        // }
+        int uart_rx_len = uart_read_bytes(uart_num, uart_rx_buffer, UART_RX_BUF_SIZE, 1);
+
+        //Write data back to UART
+        if (uart_rx_len > 4) {
+            
+            //char* msg = "abc\n";
+            if(MODBUS_CRC_pass(uart_rx_buffer, uart_rx_len)){
+                ESP_LOGI(UART1_TAG, "uart_read_bytes len=%d", uart_rx_len);
+                if(uart_rx_buffer[0]==10){
+                    if (uart_rx_buffer[1] == 0x03 && uart_rx_len == 8)
+                    {
+                        uint16_t reg_len = (uart_rx_buffer[4]<<8)+uart_rx_buffer[5];
+                        
+                        uint8_t msg[5+reg_len*2];
+                        memset(msg, 0, 5+reg_len*2);
+                        msg[0] = uart_rx_buffer[0];
+                        msg[1] = 0x03;
+                        msg[2] = (uint8_t)(reg_len*2);
+                        //uint8_t msg[] = {uart_rx_buffer[0], 0x03, 0x06, 0xAE, 0x41, 0x56, 0x52, 0x43, 0x40, 0x49, 0xAD};
+                        uint16_t crc16 = MODBUS_CRC16_V1(msg, 3+reg_len*2);
+                        msg[3+reg_len*2] = (uint8_t)(crc16 & 0xFF);
+                        msg[4+reg_len*2] = (uint8_t)(crc16 / 256);
+                        if (uart_write_bytes(uart_num, msg, 5+reg_len*2) != 5+reg_len*2)
+                        {
+                            ESP_LOGE(UART1_TAG, "Send data critical failure.");
+                        }
+                    }
+                    else if (uart_rx_buffer[1] == 0x10 && uart_rx_len > 9)
+                    {
+                        uint16_t reg_addr = (uart_rx_buffer[2]<<8)+uart_rx_buffer[3];
+                        uint16_t reg_len = (uart_rx_buffer[4]<<8)+uart_rx_buffer[5];
+                        
+                        uint8_t msg[8];
+                        memset(msg, 0, 8);
+                        memcpy(msg, uart_rx_buffer, 6);
+                        uint16_t crc16 = MODBUS_CRC16_V1(msg, 6);
+                        msg[6] = (uint8_t)(crc16 & 0xFF);
+                        msg[7] = (uint8_t)(crc16 / 256);
+                        
+                        if (uart_write_bytes(uart_num, msg, 8) != 8)
+                        {
+                            ESP_LOGE(UART1_TAG, "Send data critical failure.");
+                        }
+                    }
+                }
+            }
+            else{
+                ESP_LOGI(UART1_TAG, "uart bytes illigal, len=%d", uart_rx_len);
+            }
+            
+        }
+        if(can_bus_listen){
+            can_loop();
+        }
+        
+        vTaskDelay(1);
+    }
+}
+
+
+static uint16_t MODBUS_CRC16_V1( const uint8_t *buf, uint16_t len )
+{
+  uint16_t crc1 = 0xFFFF;
+  uint16_t i = 0;
+  uint8_t b = 0;
+
+  for ( i = 0; i < len; i++ )
+  {
+    crc1 ^= buf[i];
+
+    for ( b = 0; b < 8; b++ )
+    {
+      if ( crc1 & 0x0001 )
+      {
+        crc1 >>= 1;
+        crc1 ^= 0xA001;
+      }
+      else
+      {
+        crc1 >>= 1;
+      }
+    }
+  }
+
+  return crc1;
+}
+static bool MODBUS_CRC_pass(uint8_t* data, uint16_t data_len) {
+  uint16_t crcValue = MODBUS_CRC16_V1(data, data_len - 2);
+  if (((data[data_len - 1] << 8) + data[data_len - 2]) == crcValue) {
+
+    return true;
+  }
+  return false;
 }
