@@ -42,6 +42,24 @@
 #define LOOP_TAG             "LOOP"
 #define UART1_TAG             "UART1"
 #define CAN_TAG                 "CAN_BUS"
+
+#define RS485_ID_SELF 10
+
+struct RS485_REGISTERS {
+  uint16_t version_code;//0
+  uint16_t ble_status;//1
+  uint8_t ble_name[10];//2
+  uint16_t CAN_bus_scan_status;//7
+  uint16_t CAN_bus_scan_timeout;//8
+  uint8_t CAN_ID_241_bytes[8];//9
+  uint16_t ble_send_begin;//13
+  uint8_t ble_tx_bytes[20];//14
+  
+};
+uint16_t CAN_bus_scan_status_history = 0;
+uint32_t time_CAN_bus_scan_start = 0;
+static struct RS485_REGISTERS rs485_regs;
+
 //#define REMOTE_SERVICE_UUID   0x331a36f5245945ea9d956142f0c4b307
 //ESP_GATT_UUID_HEART_RATE_SVC
 //#define REMOTE_NOTIFY_UUID    0x2A37
@@ -143,7 +161,7 @@ static uint8_t message_send_index = 0;
 static bool scan_busy = true;
 static const int allowed_minimum_rssi = -60;
 static const char remote_device_name[] = "UB-*****";
-static char connected_device_name[10];
+//static char connected_device_name[10];
 const uint8_t remote_device_name_prefix_length = 3;
 static esp_ble_scan_params_t ble_scan_params = {
     .scan_type              = BLE_SCAN_TYPE_ACTIVE,
@@ -182,7 +200,7 @@ static struct gattc_profile_inst gl_profile_tab[PROFILE_NUM] = {
 static const int uart_num = UART_NUM_1;
 #define UART_RX_BUF_SIZE 127
 static uint8_t uart_rx_buffer[UART_RX_BUF_SIZE];
-static bool can_bus_listen = false;
+// static bool can_bus_listen = false;
 
 static uint16_t MODBUS_CRC16_V1( const uint8_t *buf, uint16_t len );
 static bool MODBUS_CRC_pass(uint8_t* data, uint16_t data_len);
@@ -455,7 +473,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         //                         ESP_GATT_AUTH_REQ_SIGNED_NO_MITM);
         message_send_index = 0;
         ble_device_ready = true;
-        
+        rs485_regs.ble_status = 1;
         break;
     case ESP_GATTC_SRVC_CHG_EVT: {
         esp_bd_addr_t bda;
@@ -475,6 +493,9 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         ESP_LOGI(GATTC_TAG, "ESP_GATTC_DISCONNECT_EVT, reason = 0x%x", p_data->disconnect.reason);
         ble_device_ready = false;
         connect = false;
+        rs485_regs.ble_status = 0;
+        memset(rs485_regs.ble_name, 0, sizeof(rs485_regs.ble_name));
+        memcpy(rs485_regs.ble_name, "UNKNOWN", 7);
         get_service = false;
         scan_busy = false;
         break;
@@ -577,12 +598,15 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             //ESP_LOGI(GATTC_TAG, "\n");
             if (adv_name != NULL) {
                 if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, remote_device_name_prefix_length) == 0) {
-                    memset(connected_device_name, 0, sizeof(connected_device_name));
-                    memcpy(connected_device_name, (char*)adv_name, sizeof(connected_device_name)-1);
+                    memset(rs485_regs.ble_name, 0, sizeof(rs485_regs.ble_name));
+                    int name_len = sizeof(rs485_regs.ble_name)-1;
+                    if(strlen((char*)adv_name)<name_len)name_len = strlen((char*)adv_name);
+                    memcpy(rs485_regs.ble_name, (char*)adv_name, name_len);
                     ESP_LOGI(GATTC_TAG, "searched device %s, rssi = %d\n", (char *)adv_name, scan_result->scan_rst.rssi);
                     if(scan_result->scan_rst.rssi >= allowed_minimum_rssi){
                         if (connect == false) {
                         connect = true;
+                        
                         ESP_LOGI(GATTC_TAG, "connect to the remote device.");
                         esp_ble_gap_stop_scanning();
                         esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, scan_result->scan_rst.ble_addr_type, true);
@@ -650,7 +674,7 @@ static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp
 }
 void ble_send_bytes(uint8_t *bytes, uint8_t len)
 {
-    if (!ble_device_ready)
+    if (!ble_device_ready || len == 0)
         return;
     esp_ble_gattc_write_char(gl_profile_tab[PROFILE_A_APP_ID].gattc_if,
                              gl_profile_tab[PROFILE_A_APP_ID].conn_id,
@@ -670,9 +694,9 @@ void ble_trigger_scan(){
 void can_loop()
 {
     twai_message_t message;
-    if (twai_receive(&message, pdMS_TO_TICKS(10000)) == ESP_OK)
+    if (twai_receive(&message, pdMS_TO_TICKS(10)) == ESP_OK)
     {
-        ESP_LOGI(CAN_TAG, "Message received");
+        //ESP_LOGI(CAN_TAG, "Message received");
     }
     else
     {
@@ -681,21 +705,23 @@ void can_loop()
     }
 
     // Process received message
-    if (message.extd)
-    {
-        ESP_LOGI(CAN_TAG, "Message is in Extended Format");
-    }
-    else
-    {
-        ESP_LOGI(CAN_TAG, "Message is in Standard Format");
-    }
+    // if (message.extd)
+    // {
+    //     ESP_LOGI(CAN_TAG, "Message is in Extended Format");
+    // }
+    // else
+    // {
+    //     ESP_LOGI(CAN_TAG, "Message is in Standard Format");
+    // }
     ESP_LOGI(CAN_TAG, "ID is %d\n", message.identifier);
     if (!(message.rtr))
     {
-        for (int i = 0; i < message.data_length_code; i++)
-        {
-            ESP_LOGI(CAN_TAG, "Data byte %d = %d\n", i, message.data[i]);
-        }
+        memcpy(rs485_regs.CAN_ID_241_bytes, message.data, message.data_length_code);
+        // for (int i = 0; i < message.data_length_code; i++)
+        // {
+        //     ESP_LOGI(CAN_TAG, "Data byte %d = %d\n", i, message.data[i]);
+
+        // }
     }
 }
 void app_main(void)
@@ -708,7 +734,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
-    
+    rs485_regs.version_code = 0x05;
+    rs485_regs.ble_status = 0;
+    memset(rs485_regs.ble_name, 0, sizeof(rs485_regs.ble_name));
+    memcpy(rs485_regs.ble_name, "UNKNOWN", 7);
+
+    rs485_regs.CAN_bus_scan_status = 0;
+    rs485_regs.CAN_bus_scan_timeout = 2000;
+
     uart_config_t uart_config = {
         .baud_rate = 19200,
         .data_bits = UART_DATA_8_BITS,
@@ -734,8 +767,12 @@ void app_main(void)
     //TWAI_GENERAL_CONFIG_DEFAULT(tx_io_num, rx_io_num, op_mode)
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(5, 8, TWAI_MODE_NORMAL);
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    //twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
+    //accept id 0x100
+    twai_filter_config_t f_config = {.acceptance_code = (0x241 << 21),
+                                             .acceptance_mask = ~(0x7FF << 21),
+                                             .single_filter = true};
     //Install TWAI driver
     if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
         ESP_LOGI(CAN_TAG, "Driver installed");
@@ -829,15 +866,23 @@ void app_main(void)
         uint32_t t = xTaskGetTickCount();
         if(t - time_request_SCAN >= 200){
             time_request_SCAN = t;
-            ESP_LOGI(LOOP_TAG, "Loop time_request_SCAN = %d, ready = %d, scan busy=%d", connect, ble_device_ready, scan_busy);
+            ESP_LOGI(LOOP_TAG, "time_request_SCAN = %d, ready = %d, scan busy=%d", connect, ble_device_ready, scan_busy);
             //char* msg = "VER\r\n";
             //ble_send_bytes((uint8_t*)msg,strlen(msg));
             if(!connect && !scan_busy){
                 ble_trigger_scan();
             }
         }
-        // if (ble_device_ready)
-        // {
+        if (ble_device_ready)
+        {
+            if(rs485_regs.ble_send_begin > 0){
+                rs485_regs.ble_send_begin = 0;
+                ESP_LOGI(LOOP_TAG, "ble_send_begin");
+                esp_log_buffer_hex(LOOP_TAG, rs485_regs.ble_tx_bytes, sizeof(rs485_regs.ble_tx_bytes));
+                ble_send_bytes(rs485_regs.ble_tx_bytes, strlen((char*)rs485_regs.ble_tx_bytes));
+                memset(rs485_regs.ble_tx_bytes, 0, sizeof(rs485_regs.ble_tx_bytes));
+            }
+        }
 
         //     if (t - time_request_MSG >= tick_interval_MSG)
         //     {
@@ -916,6 +961,25 @@ void app_main(void)
         //         }
         //     }
         // }
+        if(rs485_regs.CAN_bus_scan_status>0){
+            if(CAN_bus_scan_status_history==0){
+                CAN_bus_scan_status_history = rs485_regs.CAN_bus_scan_status;
+                time_CAN_bus_scan_start = t;
+                memset(rs485_regs.CAN_ID_241_bytes, 0, sizeof(rs485_regs.CAN_ID_241_bytes));
+
+                ESP_LOGI(CAN_TAG, "can scan start now");
+            }
+            if(t-time_CAN_bus_scan_start>=pdMS_TO_TICKS(rs485_regs.CAN_bus_scan_timeout)){
+                rs485_regs.CAN_bus_scan_status = 0;
+                CAN_bus_scan_status_history = 0;
+
+                ESP_LOGI(CAN_TAG, "can scan timeout");
+            }
+            else{
+                can_loop();
+            }
+            
+        }
         int uart_rx_len = uart_read_bytes(uart_num, uart_rx_buffer, UART_RX_BUF_SIZE, 1);
 
         //Write data back to UART
@@ -923,31 +987,55 @@ void app_main(void)
             
             //char* msg = "abc\n";
             if(MODBUS_CRC_pass(uart_rx_buffer, uart_rx_len)){
-                ESP_LOGI(UART1_TAG, "uart_read_bytes len=%d", uart_rx_len);
-                if(uart_rx_buffer[0]==10){
+                
+                if(uart_rx_buffer[0]==RS485_ID_SELF){
+                    ESP_LOGI(UART1_TAG, "uart_read_bytes len=%d", uart_rx_len);
                     if (uart_rx_buffer[1] == 0x03 && uart_rx_len == 8)
                     {
-                        uint16_t reg_len = (uart_rx_buffer[4]<<8)+uart_rx_buffer[5];
-                        
-                        uint8_t msg[5+reg_len*2];
-                        memset(msg, 0, 5+reg_len*2);
-                        msg[0] = uart_rx_buffer[0];
-                        msg[1] = 0x03;
-                        msg[2] = (uint8_t)(reg_len*2);
-                        //uint8_t msg[] = {uart_rx_buffer[0], 0x03, 0x06, 0xAE, 0x41, 0x56, 0x52, 0x43, 0x40, 0x49, 0xAD};
-                        uint16_t crc16 = MODBUS_CRC16_V1(msg, 3+reg_len*2);
-                        msg[3+reg_len*2] = (uint8_t)(crc16 & 0xFF);
-                        msg[4+reg_len*2] = (uint8_t)(crc16 / 256);
-                        if (uart_write_bytes(uart_num, msg, 5+reg_len*2) != 5+reg_len*2)
+                        uint16_t reg_len = (uart_rx_buffer[4] << 8) + uart_rx_buffer[5];
+                        uint16_t reg_addr = (uart_rx_buffer[2] << 8) + uart_rx_buffer[3];
+                        if (reg_len>0 && reg_addr * 2 + reg_len * 2 <= sizeof(rs485_regs))
                         {
-                            ESP_LOGE(UART1_TAG, "Send data critical failure.");
+                            uint8_t msg[5 + reg_len * 2];
+                            memset(msg, 0, 5 + reg_len * 2);
+                            msg[0] = uart_rx_buffer[0];
+                            msg[1] = 0x03;
+                            msg[2] = (uint8_t)(reg_len * 2);
+
+                            //memcpy(&msg[3], (&(rs485_regs.version_code)) + reg_addr, reg_len * 2);
+                            for(uint16_t i = 0; i<reg_len;i++){
+                                uint16_t *a= (&(rs485_regs.version_code)) + reg_addr+i;
+                                //memcpy(&msg[3+i*2], a, 2);
+                                msg[3+i*2] = (uint8_t)(*a/256);
+                                msg[4+i*2] = (uint8_t)(*a%256);
+                            }
+                            // uint8_t msg[] = {uart_rx_buffer[0], 0x03, 0x06, 0xAE, 0x41, 0x56, 0x52, 0x43, 0x40, 0x49, 0xAD};
+                            uint16_t crc16 = MODBUS_CRC16_V1(msg, 3 + reg_len * 2);
+                            msg[3 + reg_len * 2] = (uint8_t)(crc16 & 0xFF);
+                            msg[4 + reg_len * 2] = (uint8_t)(crc16 / 256);
+                            if (uart_write_bytes(uart_num, msg, 5 + reg_len * 2) != 5 + reg_len * 2)
+                            {
+                                ESP_LOGE(UART1_TAG, "Send data critical failure.");
+                            }
+                            else ESP_LOGI(UART1_TAG, "RS485 Send data %d,%d",reg_addr,reg_len);
                         }
                     }
                     else if (uart_rx_buffer[1] == 0x10 && uart_rx_len > 9)
                     {
                         uint16_t reg_addr = (uart_rx_buffer[2]<<8)+uart_rx_buffer[3];
                         uint16_t reg_len = (uart_rx_buffer[4]<<8)+uart_rx_buffer[5];
-                        
+                        if (reg_len>0 && reg_addr * 2 + reg_len * 2 <= sizeof(rs485_regs))
+                        {
+                            for(uint16_t i = 0; i<reg_len;i++){
+
+                                uint16_t a = (uart_rx_buffer[7+i*2]<<8)+uart_rx_buffer[8+i*2];
+                                uint16_t *addr= (uint16_t*)((&(rs485_regs.version_code)) + reg_addr+i);
+                                *addr = a;
+                                //memcpy(&msg[3+i*2], a, 2);
+                                //msg[3+i*2] = (uint8_t)(*a/256);
+                                //msg[4+i*2] = (uint8_t)(*a%256);
+                            }
+                        }
                         uint8_t msg[8];
                         memset(msg, 0, 8);
                         memcpy(msg, uart_rx_buffer, 6);
@@ -966,9 +1054,6 @@ void app_main(void)
                 ESP_LOGI(UART1_TAG, "uart bytes illigal, len=%d", uart_rx_len);
             }
             
-        }
-        if(can_bus_listen){
-            can_loop();
         }
         
         vTaskDelay(1);
