@@ -54,7 +54,8 @@ struct RS485_REGISTERS {
   uint8_t CAN_ID_241_bytes[8];//9
   uint16_t ble_send_begin;//13
   uint8_t ble_tx_bytes[20];//14
-  
+  uint8_t CAN_ID_242_bytes[8];//24
+  uint8_t ble_rx_bytes[32];//28
 };
 uint16_t CAN_bus_scan_status_history = 0;
 uint32_t time_CAN_bus_scan_start = 0;
@@ -154,9 +155,9 @@ static bool connect = false;
 static bool get_service = false;
 static bool ble_device_ready = false;
 
-static uint32_t time_request_MSG = 0;
+// static uint32_t time_request_MSG = 0;
 static uint32_t time_request_SCAN = 0;
-static uint32_t tick_interval_MSG = 200;
+// static uint32_t tick_interval_MSG = 200;
 static uint8_t message_send_index = 0;
 static bool scan_busy = true;
 static const int allowed_minimum_rssi = -60;
@@ -455,6 +456,12 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
     case ESP_GATTC_NOTIFY_EVT:
         ESP_LOGI(GATTC_TAG, "ESP_GATTC_NOTIFY_EVT, receive notify value:");
         esp_log_buffer_hex(GATTC_TAG, p_data->notify.value, p_data->notify.value_len);
+        int len_max = sizeof(rs485_regs.ble_rx_bytes);
+        if(p_data->notify.value_len<len_max){
+            len_max = p_data->notify.value_len;
+        }
+        memcpy(rs485_regs.ble_rx_bytes, p_data->notify.value, len_max);
+
         break;
     case ESP_GATTC_WRITE_DESCR_EVT:
         if (p_data->write.status != ESP_GATT_OK){
@@ -713,10 +720,16 @@ void can_loop()
     // {
     //     ESP_LOGI(CAN_TAG, "Message is in Standard Format");
     // }
-    ESP_LOGI(CAN_TAG, "ID is %d\n", message.identifier);
+    //ESP_LOGI(CAN_TAG, "ID is %d\n", message.identifier);
     if (!(message.rtr))
     {
-        memcpy(rs485_regs.CAN_ID_241_bytes, message.data, message.data_length_code);
+        if(message.identifier==0x241){
+            memcpy(rs485_regs.CAN_ID_241_bytes, message.data, message.data_length_code);
+        }
+        else if(message.identifier==0x242){
+            memcpy(rs485_regs.CAN_ID_242_bytes, message.data, message.data_length_code);
+        }
+        
         // for (int i = 0; i < message.data_length_code; i++)
         // {
         //     ESP_LOGI(CAN_TAG, "Data byte %d = %d\n", i, message.data[i]);
@@ -745,7 +758,7 @@ void app_main(void)
     uart_config_t uart_config = {
         .baud_rate = 19200,
         .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
+        .parity = UART_PARITY_EVEN,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .rx_flow_ctrl_thresh = 122
@@ -753,7 +766,7 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_driver_install(uart_num, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
     // Set UART pins(TX: IO4, RX: IO5, RTS: IO18, CTS: IO19)
-    ESP_ERROR_CHECK(uart_set_pin(uart_num, 3, 4, -1, -1));
+    ESP_ERROR_CHECK(uart_set_pin(uart_num, 4, 3, -1, -1));
     // Set RS485 half duplex mode
     ESP_ERROR_CHECK(uart_set_mode(uart_num, UART_MODE_RS485_HALF_DUPLEX));
 
@@ -770,8 +783,8 @@ void app_main(void)
     //twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     //accept id 0x100
-    twai_filter_config_t f_config = {.acceptance_code = (0x241 << 21),
-                                             .acceptance_mask = ~(0x7FF << 21),
+    twai_filter_config_t f_config = {.acceptance_code = (0x241 << 21) ,
+                                             .acceptance_mask = ~(0x7FC << 21),
                                              .single_filter = true};
     //Install TWAI driver
     if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
@@ -879,8 +892,11 @@ void app_main(void)
                 rs485_regs.ble_send_begin = 0;
                 ESP_LOGI(LOOP_TAG, "ble_send_begin");
                 esp_log_buffer_hex(LOOP_TAG, rs485_regs.ble_tx_bytes, sizeof(rs485_regs.ble_tx_bytes));
+                //reset ble_rx_bytes to receive
+                memset(rs485_regs.ble_rx_bytes, 0, sizeof(rs485_regs.ble_rx_bytes));
                 ble_send_bytes(rs485_regs.ble_tx_bytes, strlen((char*)rs485_regs.ble_tx_bytes));
                 memset(rs485_regs.ble_tx_bytes, 0, sizeof(rs485_regs.ble_tx_bytes));
+                
             }
         }
 
@@ -966,7 +982,7 @@ void app_main(void)
                 CAN_bus_scan_status_history = rs485_regs.CAN_bus_scan_status;
                 time_CAN_bus_scan_start = t;
                 memset(rs485_regs.CAN_ID_241_bytes, 0, sizeof(rs485_regs.CAN_ID_241_bytes));
-
+                memset(rs485_regs.CAN_ID_242_bytes, 0, sizeof(rs485_regs.CAN_ID_242_bytes));
                 ESP_LOGI(CAN_TAG, "can scan start now");
             }
             if(t-time_CAN_bus_scan_start>=pdMS_TO_TICKS(rs485_regs.CAN_bus_scan_timeout)){
